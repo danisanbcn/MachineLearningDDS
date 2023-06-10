@@ -1,0 +1,259 @@
+---
+title: "IDSml"
+author: "Daniel García"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(randomForest)
+library(readr)
+library(caret)
+library(e1071)
+library(ggplot2)
+library(dplyr)
+```
+
+## PRÁCTICA DE MACHINE LEARNING
+
+La idea de ésta práctica (teniendo poco conocimiento en el área) es crear un modelo de Machine Learning que sea lo más *accurated* a la hora de detectar qué es un ataque y qué no lo es si le hacemos analizar un *dataset* que contenga los mismos campos hemos elegido para entrenarla. El origen del *raw data* será el *dataset* de KDD CUP 1999.
+  
+  - Origen de datos [KDD Cup 1999 Data Data Set](https://archive.ics.uci.edu/ml/datasets/kdd+cup+1999+data)
+  - Ayuda para entender conceptos [ChatGPT 3](https://chat.openai.com/)
+  
+**Objetivos**
+
+  - Entender el modelo :white_check_mark:
+  - Entender el código :white_check_mark:
+  - Aprender a manipular el origen de datos :white_check_mark:
+  - Hacer un proyecto portable :white_check_mark:
+  
+Para comprobar la efectividad del modelo y la portabilidad del mismo, he incluido en el repositorio el fichero **kdd_reduced.csv** para usarlo como origen de datos. Cambiar el origen en la linea 38 y se puede probar que la efectividad sigue siendo del 98%. Éstos datos son las 312000 primeras linas del *dataset* original. No he podido incluir todo el *dataset* dado que ocupa más de 100MB y Github tiene restricciones.
+
+El ejercicio ha sido probado con ambos *datasets*. Pero el análisis lo haremos con el original de la práctica (Book1.csv) puesto que el muestreo de ataques era más variado y es más ***"divertido"*** de analizar.
+
+```{r read_data, echo=FALSE}
+data_full <- read_csv("Book1.csv",
+                  col_types = cols(SrcBytes = col_integer(),
+                                   DstBytes = col_integer(), Land = col_integer(),
+                                   WrongFragment = col_integer(), Urgent = col_number(),
+                                   Hot = col_number(), NumFailedLogin = col_integer()))
+
+data <- read.csv (file="KDD_Data_Train.csv",header=T)
+
+```
+
+**Dado éste origen de datos vamos a hacernos un par de cuestiones que nos ayudarán a entrenar el modelo.** 
+
+1. ¿Cuál es el ránquing del ataque más popular?
+2. ¿Qué características se dan más en un ataque?
+3. ¿Entonces qué campos nos vamos a quedar del *raw data*?
+
+Respondamos la primera.
+
+### 1. ¿Cuál es el ránquing del ataque más popular?
+
+```{r mostrar_ranking_ataques, echo=FALSE}
+mostrar_ranking_ataques <- function(data_full) {
+  # Filtrar los ataques que no sean "normal"
+  ataques <- subset(data_full, Attack != "normal")
+  
+  # Calcular la frecuencia de cada ataque
+  frecuencia_ataques <- table(ataques$Attack)
+  
+  # Ordenar los ataques por frecuencia de forma descendente
+  ranking <- sort(frecuencia_ataques, decreasing = TRUE)
+  
+  # Mostrar el ranking de ataques
+  cat("Ranking de ataques más populares:\n")
+  for (i in seq_along(ranking)) {
+    cat(i, ": ", names(ranking)[i], " (", ranking[i], " ocurrencias)\n")
+  }
+}
+
+# Ejemplo de uso:
+mostrar_ranking_ataques(data_full)
+```
+
+Vemos que los ataques más comunes dentro de éste set de datos son los de tipo *smurf* y *neptune*. 
+Los categorizados de tipo **normal** se trata de peticiones o conexiones legítimas.
+Curioso que haya más peticiones/conexiones de *smurf* que no de normal, ¿verdad?.
+
+**¿Cuál es el tipo de ataque más empleado?**
+
+```{r mostrar_mapa_calor_ataques, echo=FALSE}
+
+mostrar_mapa_calor_ataques <- function(data_full) {
+  # Filtrar los ataques que no sean "normal"
+  ataques <- subset(data_full, Attack != "normal")
+  
+  # Calcular la frecuencia de cada ataque
+  frecuencia_ataques <- table(ataques$Attack)
+  
+  # Crear un data frame para el mapa de calor
+  df_mapa_calor <- data.frame(Ataque = names(frecuencia_ataques),
+                              Frecuencia = as.numeric(frecuencia_ataques))
+  
+  # Ordenar los ataques por frecuencia de forma descendente
+  df_mapa_calor <- df_mapa_calor[order(df_mapa_calor$Frecuencia, decreasing = TRUE), ]
+  
+  # Generar el mapa de calor
+  mapa_calor <- ggplot(df_mapa_calor, aes(x = 1, y = reorder(Ataque, Frecuencia), fill = Frecuencia)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    labs(x = "", y = "") +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 10),
+          legend.position = "none")
+  
+  # Mostrar el mapa de calor
+  print(mapa_calor)
+}
+
+# Ejemplo de uso:
+mostrar_mapa_calor_ataques(data_full)
+```
+
+Dado éstos *big ones*. Vamos a centrarnos a analizar qué se hace en en este tipo de ataques. Para poder dar respuesta a la segunda pregunta.
+
+### ¿Qué características se dan más en un ataque?
+
+Hemos preguntado a la ingeligencia aritificial más popular del momento alimentandola primero con contexto. Para que nos responda a unas preguntas.
+
+***En los ataques que hay en el modelo kdd cup 1999 sabrías explicarme qué es un ataque de tipo smurf? De manera resumida, por favor***
+
+>Claro, un ataque Smurf es un tipo de ataque de denegación de servicio (DDoS) que aprovecha una vulnerabilidad en el protocolo ICMP. 
+>Consiste en enviar un gran número de paquetes ICMP de solicitud de eco (ping) a una red utilizando direcciones IP falsificadas. Los hosts de la red objetivo intentan responder a estos paquetes, pero las respuestas son dirigidas a la víctima real en lugar del atacante. Esto sobrecarga la víctima con un gran volumen de tráfico ICMP y puede dejarla inaccesible.
+
+***En los ataques que hay en el modelo kdd cup 1999 sabrías explicarme qué es un ataque de tipo neptune? De manera resumida, por favor***
+
+>Claro, un ataque de tipo Neptune es otro tipo de ataque de denegación de servicio (DDoS) que tiene como objetivo agotar los recursos del sistema objetivo, como el consumo de ancho de banda, los recursos de memoria y la capacidad de procesamiento. 
+>El ataque Neptune se basa en enviar un gran número de solicitudes falsas al sistema objetivo para que responda con paquetes de datos. Esto satura el sistema y lo hace incapaz de responder a solicitudes legítimas, lo que resulta en una denegación de servicio para los usuarios legítimos.
+
+¡Gracias ChatGPT!
+
+Vemos que la tendencia en éste set son los ataques de DDoS. Ataques en los que no hace falta hacer *information gathering* ni explorar un sitio para explotar fallos de la aplicación (sqli por ejemplo), o bien, explotar vulnerabilidades de un servicio o aplicación dada su versión/parcheado (apache, wordpress, tomcat, ftp...). 
+
+Entonces vamos a la tercera pregunta.
+
+
+
+### ¿Entonces qué campos nos vamos a quedar del *raw data*?
+
+Entendemos entonces, dado que la mayoría de ataques son DDoS, la tendencias es no hacer login para atacar. Veamos si hay una relación de login o no con los ataques.
+
+```{r mostrar_relacion_login, echo=FALSE}
+relacion_campos <- function(data) {
+  data$LoggedIn <- as.factor(data$LoggedIn)  # Convertir a factor
+  
+  ggplot(data, aes(x = NumFailedLogin, fill = LoggedIn)) +
+    geom_bar(position = "fill") +
+    facet_wrap(~ Attack) +
+    labs(x = "NumFailedLogin", y = "Proporción") +
+    ggtitle("Relación entre NumFailedLogin, LoggedIn y Attack") +
+    theme_minimal()
+}
+
+relacion_campos(data_full)
+```
+
+La hay. Claramente la mayoría son sin login. Pero no descartaremos los ataques que han hecho uso de éste para entrenar el modelo.
+
+Es importante que entendamos todos los campos y la naturaleza de su contenido para manipularlos y explotarlos. Y quedarnos con aquellos que nos interesan más para entrenar a nuestro modelo. Estudiados los más de 40 campos (gracias a Google y ChatGPT) voy a explicar con cuales me he quedado y por qué.
+
+- **SrcBytes:** Número de bytes transferidos desde el origen al destino. Representa la cantidad de datos enviados desde el origen de la conexión. *Importante para ataques DDoS*
+- **DstBytes:** Número de bytes transferidos desde el destino al origen. Indica la cantidad de datos recibidos por el origen de la conexión. *Importante para ataques DDoS*
+- **Service:** Tipo de servicio de red utilizado. Especifica el servicio de red al que pertenece la conexión (por ejemplo, http, ftp, ssh, etc.). *Importante para clasificar la naturaleza del ataque*
+- **Land:** Indicador de si la conexión es del tipo "land". Este valor se establece en 1 si la conexión se originó y se dirige al mismo host y puerto. *Importante para identificar, recordemos, los ataques smurf*
+- **WrongFragment:** Indicador de fragmentos incorrectos o sospechosos. Se establece en 1 si se detecta algún problema o sospecha en los fragmentos de la conexión. *Importante para los ataques DDoS*
+- **Urgent:** Indicador de paquetes urgentes. Este campo indica si se han enviado paquetes marcados como urgentes durante la conexión. *Importante para los ataques DDoS*
+- **SameSrvRate:** Proporción de conexiones al mismo servicio en el último segundo. Representa la frecuencia de conexiones al mismo servicio en el último segundo. *Importante para los ataques DDoS*
+- **NumFailedLogin:** Número de intentos de inicio de sesión fallidos. Indica la cantidad de intentos de inicio de sesión que han fallado antes de la conexión actual. *Importante para ataques de fuerza bruta*
+- **LoggedIn:** Indicador de si el usuario ha iniciado sesión. Este campo se establece en 1 si el usuario ha iniciado sesión en el sistema. *Importante para ataques de explotación de fallos de la aplicación*
+- **DstHostSameSrvRate:** Proporción de conexiones al mismo servicio en el destino como la actual en el último segundo. Representa la frecuencia de conexiones al mismo servicio en el destino en el último segundo. *Importante para identificar, recordemos, los ataques DDoS*
+- **DstHostSrvCount:** Número de conexiones al mismo servicio en el destino como la actual en el último segundo. Indica la cantidad de conexiones al mismo servicio en el destino como la conexión actual en el último segundo. *Importante para identificar, recordemos, los ataques DDoS*
+- **Flag:** Estado de la conexión. Representa el estado actual de la conexión (por ejemplo, establecido, fin, inicio, etc.). *Importante para identificar conexiones legitimas*
+- **Attack:** Etiqueta que indica el tipo de ataque. Este campo especifica el tipo de ataque que se ha producido en la conexión. *Aquí está la magia de la estadistica de si es un ataque o no, creo*
+
+Entonces tal que así, sanitizamos los datos.
+
+```{r feature_selection}
+data1 <- data[,c("SrcBytes", "DstBytes", "Service", "Land", "WrongFragment", "Urgent", "SameSrvRate", "NumFailedLogin", "LoggedIn", "DstHostSameSrvRate", "DstHostSrvCount","Flag","Attack" )]
+
+data1$Attack <- as.factor(data1$Attack)
+```
+
+## Entrenamiento
+
+Y entrenamos el modelo. Con una proporción del 50%.
+
+```{r train_test}
+inTrain <- createDataPartition(y=data1$Attack,p=0.5, list=FALSE)
+str (data1)
+training <- data1[inTrain,]
+testing <- data1[-inTrain,]
+dim <-nrow (training)
+dim(training)
+```
+
+El *warning* que obtengo es debido a que algunas clases en la columna "Attack" tienen solo un registro, lo que significa que solo hay una instancia de esa clase en el dataset. En consecuencia, al realizar la partición de los datos utilizando la función createDataPartition(), estas clases con un solo registro se seleccionarán en la muestra. Haciendo pruebas no he sabido como librarme del warning y tampoco sabría decir si me perjudica o no. Pero sigamos adelante para ver resultados.
+
+Entrenamos un modelo de Random Forest utilizando el conjunto de datos de entrenamiento y muestramos información detallada sobre el modelo, así como un gráfico de la importancia de las variables predictoras
+
+```{r train_random_forest, echo=FALSE}
+output.forest <- randomForest(Attack ~ ., data = training)
+print(output.forest)
+plot(output.forest)
+```
+
+Después de entrenar el Random Forest se realiza la predicción utilizando el conjunto de pruebas. Este paso de predicción es importante para evaluar el rendimiento del modelo entrenado en datos no vistos previamente. Se pueden comparar las predicciones con las etiquetas reales de las muestras del conjunto de pruebas para evaluar la precisión y el rendimiento del modelo en la tarea de clasificación.
+
+```{r predict, echo=FALSE}
+pred <- predict(output.forest,testing)
+str (pred)
+
+```
+
+Validamos y comprobamos el *ratio* de aciertos.
+
+```{r simple_validation, echo=FALSE}
+valid <- testing
+valid$Attack <- as.character(valid$Attack)
+valid$pred <- as.character(pred)
+valid$match <- valid$Attack == valid$pred
+
+table(valid$match)/nrow(valid)
+```
+
+La tabla resultante muestra la cantidad de registros para cada combinación de valores en las columnas "match" y "Attack". Esto proporciona una visión general de cómo se están clasificando los registros y puede ayudar a evaluar el rendimiento del modelo en la detección de diferentes tipos de ataques.
+
+```{r simple_validation2, echo=FALSE}
+table(valid[, c("match", "Attack")])
+```
+
+En ésta tabla se muestra la cantidad de registros clasificados correctamente e incorrectamente por el modelo en función de las predicciones y los valores reales.
+
+La matriz de confusión muestra cuatro valores:
+
+**Verdaderos positivos (True Positives, TP):** El número de registros que fueron correctamente clasificados como ataques.
+**Verdaderos negativos (True Negatives, TN):** El número de registros que fueron correctamente clasificados como no ataques.
+**Falsos positivos (False Positives, FP):** El número de registros que fueron incorrectamente clasificados como ataques cuando en realidad eran no ataques.
+**Falsos negativos (False Negatives, FN):** El número de registros que fueron incorrectamente clasificados como no ataques cuando en realidad eran ataques.
+
+```{r conf_matrix, echo=FALSE}
+valid <- testing
+cm <- confusionMatrix(pred, testing$Attack)
+kableExtra::kable(cm$table)
+```
+
+En el siguiente mapa de calor la presencia de una franja blanca entre "ftp_write" y "xsnoop" en él puede indicar que no hay registros o muestras en el conjunto de datos para esos dos tipos de ataques específicos. Esto significa que no se produjeron instancias de ataques "ftp_write" y "xsnoop" en los datos utilizados para entrenar y evaluar el modelo.
+
+```{r conf_matrix_heatmap, echo=FALSE}
+heatmap(cm$table)
+```
+
+
+### En resumen
+En general, el modelo logró una tasa de precisión de alrededor del 98 % según los resultados de la validación. Esto significa que hemos clasificado correctamente aproximadamente el 98% de las instancias en los datos de prueba. Es un resultado prometedor (creo), pero es importante considerar otras métricas de evaluación y realizar más análisis para garantizar la solidez de su modelo.
